@@ -136,7 +136,17 @@ class PytchatCore:
             returned 75.
             """
             self._load_session()
-            self.continuation = self._session.continuations[0] if self._session else None
+            if self._session:
+                # The first token on the page is the placeholder it mounts before
+                # the chat pane has data — measured across four streams, it was
+                # the only candidate that returned nothing. Ask which one has
+                # chat instead of assuming index 0. The probe's payload is
+                # discarded: the poll below re-requests this token, which costs
+                # one request and keeps the reader free of priming state.
+                picked = resolver.pick(self._client, self._session)
+                self.continuation = (
+                    picked[0] if picked else self._session.continuations[0]
+                )
 
     def _load_session(self):
         self._session = resolver.resolve(self._client, self._video_id)

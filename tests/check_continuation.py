@@ -80,6 +80,94 @@ def check_no_generated_tokens():
     print("ok  generated-token modules are removed")
 
 
+def check_picks_the_chat_candidate():
+    """Index 0 is the page's placeholder; `pick` must skip it.
+
+    Measured on four live streams, actions per candidate were [0, 6, 6],
+    [1, 86, 86], [1, 72, 76] and [0, 77, 77] — the first token was always the
+    worst. So the selection is checked against those exact shapes rather than
+    against a mock that would just agree with whatever it was given.
+    """
+    session = resolver.Session(
+        video_id="vid",
+        api_key="KEY",
+        client_version="2.20261016.01.00",
+        continuations=("PLACEHOLDER", "SECOND", "THIRD"),
+        is_replay=False,
+    )
+
+    class _Stub:
+        """Answers per token, the way the page did."""
+
+        def __init__(self, counts):
+            self.counts = counts
+            self.posted = []
+
+        def post(self, url, json):  # noqa: A002 — httpx's parameter name
+            self.posted.append(json["continuation"])
+            actions = [{"x": 1}] * self.counts[json["continuation"]]
+
+            class _Resp:
+                def __init__(self, payload):
+                    self._payload = payload
+
+                def json(self):
+                    return self._payload
+
+            return _Resp({
+                "continuationContents": {"liveChatContinuation": {"actions": actions}}
+            })
+
+    for counts, expected in (
+        ({"PLACEHOLDER": 0, "SECOND": 6, "THIRD": 6}, "SECOND"),
+        ({"PLACEHOLDER": 1, "SECOND": 86, "THIRD": 86}, "SECOND"),
+        # 72 vs 76: the third candidate is the fuller feed, so it wins. This is
+        # the case that proves "most" and not "first non-empty".
+        ({"PLACEHOLDER": 1, "SECOND": 72, "THIRD": 76}, "THIRD"),
+        ({"PLACEHOLDER": 0, "SECOND": 77, "THIRD": 77}, "SECOND"),
+    ):
+        stub = _Stub(counts)
+        picked = resolver.pick(stub, session)
+        assert picked is not None, counts
+        assert picked[0] == expected, f"{counts}: picked {picked[0]}, wanted {expected}"
+
+    # A quiet stream: nothing has chat, so the caller keeps its fallback.
+    quiet = resolver.pick(_Stub({"PLACEHOLDER": 0, "SECOND": 0, "THIRD": 0}), session)
+    assert quiet is None, "an all-empty stream should not claim a winner"
+    print("ok  candidate selection skips the placeholder token")
+
+
+def check_pacing_is_bounded():
+    """A backlog must not be paced back out one message at a time.
+
+    `abs_diff` is the lag against the first message ever seen, so on any stream
+    older than a few seconds `wait_total_sec` never shrinks and every batch was
+    paced: 71 messages took 68 seconds to yield while the HTTP request behind
+    them took 0.09. This asserts the delivery time, which is the only thing the
+    caller can feel.
+    """
+    import time as _time
+
+    from pytchat.processors.default.processor import Chatdata
+
+    class _Msg:
+        def __init__(self, ts):
+            self.timestamp = ts
+
+    now_ms = _time.time() * 1000
+    # 70 messages spread over the last 60 seconds — an ordinary busy batch — and
+    # an `abs_diff` large enough that the queue is a minute behind.
+    items = [_Msg(now_ms - 60_000 + i * 850) for i in range(70)]
+    data = Chatdata(items, 10.0, _time.time() - 120)
+
+    start = _time.time()
+    got = list(data.sync_items())
+    elapsed = _time.time() - start
+    assert len(got) == 70, len(got)
+    assert elapsed < 5, f"delivering 70 messages took {elapsed:.1f}s"
+    print(f"ok  pacing bounded (70 messages in {elapsed:.1f}s)")
+
+
 def check_live(video_id: str):
     """The whole path, against a real stream. Opt-in."""
     import time
@@ -107,6 +195,8 @@ if __name__ == "__main__":
     check_request_body()
     check_session_parsing()
     check_no_generated_tokens()
+    check_picks_the_chat_candidate()
+    check_pacing_is_bounded()
     if "--live" in sys.argv:
         check_live(sys.argv[sys.argv.index("--live") + 1])
     print("SELF-CHECK OK")

@@ -163,7 +163,9 @@ class LiveChat:
             self._session = resolver.resolve(self._client, self._video_id)
             self._api_key = self._session.api_key
             self._client_version = self._session.client_version
-            self.continuation = self._session.continuations[0]
+            # Index 0 is the page's placeholder token, not its chat token.
+            picked = resolver.pick(self._client, self._session)
+            self.continuation = picked[0] if picked else self._session.continuations[0]
         self._listen(self.continuation)
 
     def _listen(self, continuation):
@@ -228,7 +230,8 @@ class LiveChat:
                 self._session = resolver.resolve(self._client, self._video_id)
                 self._api_key = self._session.api_key
                 self._client_version = self._session.client_version
-                continuation = self._session.continuations[0]
+                picked = resolver.pick(self._client, self._session)
+                continuation = picked[0] if picked else self._session.continuations[0]
 
         return continuation
 

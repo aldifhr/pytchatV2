@@ -26,6 +26,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from .. import config
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -200,3 +202,69 @@ async def player_seek_async(client: httpx.AsyncClient, session: Session) -> str 
         return None
     match = _RE_PLAYER_SEEK.search(text)
     return match.group(1) if match else None
+
+
+# --- picking the right candidate -------------------------------------------
+#
+# A page ships three tokens, and the first one is not the chat token: it is the
+# placeholder the page mounts before the chat pane has data. Measured across four
+# streams, actions per candidate were [0, 6, 6], [1, 86, 86], [1, 72, 76],
+# [0, 77, 77] — index 0 was always the worst. A reader that always took index 0
+# therefore opened with an empty poll, every time.
+#
+# So the candidates are tried in order and the first one that comes back with
+# chat wins. That costs one extra request per reader start and removes a failure
+# mode that looked exactly like a quiet stream.
+
+def _action_count(payload: dict) -> int:
+    contents = (payload.get("continuationContents") or {}).get("liveChatContinuation") or {}
+    return len(contents.get("actions") or [])
+
+
+def pick(client: httpx.Client, session: Session) -> tuple[str, dict] | None:
+    """The candidate carrying the most chat, with the payload it returned.
+
+    Not "the first candidate with any chat": the placeholder does return
+    something — measured [1, 86, 86] on one stream — so a non-empty test picks it
+    and the reader opens on a single stale system message. The most is the one
+    that is actually the chat feed.
+
+    Returns `None` when every candidate is empty, which is a quiet stream rather
+    than a broken one; the caller keeps its fallback.
+    """
+    url = f"{config.LIVE_CHAT_URL}?key={session.api_key}&prettyPrint=false"
+    best: tuple[str, dict] | None = None
+    best_count = 0
+    for token in session.continuations:
+        try:
+            payload = client.post(
+                url, json={"context": {"client": session.client}, "continuation": token}
+            ).json()
+        except (httpx.HTTPError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        count = _action_count(payload)
+        if count > best_count:
+            best, best_count = (token, payload), count
+    return best
+
+
+async def pick_async(client: httpx.AsyncClient, session: Session) -> tuple[str, dict] | None:
+    """`pick`, for an async client."""
+    url = f"{config.LIVE_CHAT_URL}?key={session.api_key}&prettyPrint=false"
+    best: tuple[str, dict] | None = None
+    best_count = 0
+    for token in session.continuations:
+        try:
+            payload = (await client.post(
+                url, json={"context": {"client": session.client}, "continuation": token}
+            )).json()
+        except (httpx.HTTPError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        count = _action_count(payload)
+        if count > best_count:
+            best, best_count = (token, payload), count
+    return best

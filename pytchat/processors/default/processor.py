@@ -74,6 +74,20 @@ class Chatdata:
         await asyncio.sleep(wait_sec)
 
     def sync_items(self):
+        """Yield the batch, paced to the speed the messages arrived.
+
+        The pacing is the point: a batch of 70 messages carries timestamps spread
+        over the last minute, and replaying them instantly would dump a minute of
+        chat into one frame. What was wrong is the budget. `abs_diff` is the lag
+        between wall clock and the *first* message ever seen, so on any stream
+        more than a few seconds old it makes `wait_total_sec` negative, the queue
+        never catches up, and every yield pays a full sleep — measured 45-68s to
+        deliver one 70-message batch, while the HTTP request behind it took
+        0.09s.
+
+        The cap keeps the pacing but bounds it: if the backlog is larger than one
+        batch interval, the stream is behind and dumping it is the right answer.
+        """
         starttime = time.time()
         if len(self.items) > 0:
             last_chattime = self.items[-1].timestamp / 1000
@@ -81,18 +95,26 @@ class Chatdata:
             wait_total_sec = max(tobe_disptime - time.time(), 0)
             if len(self.items) > 1:
                 wait_sec = wait_total_sec / len(self.items)
-            elif len(self.items) == 1:
+            else:
+                wait_sec = 0
+            # A backlog bigger than one batch interval is history, not live
+            # chat: pacing it would make the caller wait the past back out. The
+            # bug was that `abs_diff` (lag against the first message ever seen)
+            # makes that backlog permanent on any stream older than a few
+            # seconds, so every batch was paced — 71 messages, 68 seconds, for a
+            # request that took 0.09s.
+            if wait_total_sec > max(self.interval, 1):
                 wait_sec = 0
             for c in self.items:
-                if wait_sec < 0:
-                    wait_sec = 0
-                time.sleep(wait_sec)
+                if wait_sec > 0:
+                    time.sleep(wait_sec)
                 yield c
         stop_interval = time.time() - starttime
         if stop_interval < 1:
             time.sleep(1 - stop_interval)
 
     async def async_items(self):
+        """`sync_items`' twin, with the same bounded pacing; see its docstring."""
         starttime = time.time()
         if len(self.items) > 0:
             last_chattime = self.items[-1].timestamp / 1000
@@ -100,14 +122,15 @@ class Chatdata:
             wait_total_sec = max(tobe_disptime - time.time(), 0)
             if len(self.items) > 1:
                 wait_sec = wait_total_sec / len(self.items)
-            elif len(self.items) == 1:
+            else:
+                wait_sec = 0
+            if wait_total_sec > max(self.interval, 1):
                 wait_sec = 0
             for c in self.items:
-                if wait_sec < 0:
-                    wait_sec = 0
-                await asyncio.sleep(wait_sec)
+                if wait_sec > 0:
+                    await asyncio.sleep(wait_sec)
                 yield c
-                
+
         stop_interval = time.time() - starttime
         if stop_interval < 1:
             await asyncio.sleep(1 - stop_interval)
