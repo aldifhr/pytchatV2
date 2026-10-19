@@ -58,6 +58,18 @@ class ChatDataFinished(ChatParseException):
     pass
 
 
+class ReplayUnavailable(ChatDataFinished):
+    '''
+    Thrown when archived chat cannot be fetched.
+
+    Distinct from a bad token: YouTube stopped serving `get_live_chat_replay` to
+    every client in mid-October 2025 (reported against chat-downloader, yt-dlp
+    and ytarchive alike). Failing as `ChatDataFinished` keeps a caller's replay
+    loop ending the way a finished stream should, while the message says why.
+    '''
+    pass
+
+
 class ReceivedUnknownContinuation(ChatParseException):
     pass
 

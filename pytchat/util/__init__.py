@@ -11,9 +11,30 @@ PATTERN = re.compile(r"(.*)\(([0-9]+)\)$")
 
 PATTERN_YTURL = re.compile(r"((?<=(v|V)/)|(?<=be/)|(?<=(\?|\&)v=)|(?<=embed/))([\w-]+)")
 
-PATTERN_CHANNEL = re.compile(r"\\\"channelId\\\":\\\"(.{24})\\\"")
+# The embed and mobile pages no longer emit plain JSON: the payload is escaped
+# with `\x22` for `"`, so `"channelId":"UC..."` never appears as written and both
+# patterns below matched nothing for years. Kept as alternates rather than
+# replaced, so the day the escape changes again one of them still lands.
+_CHANNEL_ID = r"UC[A-Za-z0-9_-]{22}"
 
-PATTERN_M_CHANNEL = re.compile(r"\"channelId\":\"(.{24})\"")
+PATTERN_CHANNEL = re.compile(
+    r'\\x22channelId\\x22:\\x22(' + _CHANNEL_ID + r')\\x22'
+    r'|\\"channelId\\":\\"(' + _CHANNEL_ID + r')\\"'
+)
+
+PATTERN_M_CHANNEL = re.compile(
+    r'\\x22channelId\\x22:\\x22(' + _CHANNEL_ID + r')\\x22'
+    r'|"channelId":"(' + _CHANNEL_ID + r')"'
+)
+
+
+def _first_group(match):
+    """The id from whichever alternative matched.
+
+    Two capture groups rather than one because the two shapes need different
+    quoting; only one of them can ever be populated on a given page.
+    """
+    return next(g for g in match.groups() if g)
 
 YT_VIDEO_ID_LENGTH = 11
 
@@ -56,24 +77,32 @@ def checkpath(filepath):
     return newpath
 
 
-def get_param(continuation, replay=False, offsetms: int = 0, dat=''):
-    if offsetms < 0:
-        offsetms = 0
+def get_param(continuation, replay=False, offsetms: int = 0, dat='', client_version: str | None = None):
+    """The request body for one chat poll.
+
+    Minimal on purpose. The 2021 version sent a full `client` block with a
+    `visitorData` seeded from a previous response; measured today, the page's own
+    continuation works with nothing but `clientName`, `clientVersion` and the
+    token, and a `visitorData` carried over from an earlier session was one more
+    thing that could be stale.
+
+    `client_version` comes from the page the token was taken from. It defaults to
+    the module constant only so a caller that has no page — an old script, a
+    test — still builds a body; the version YouTube checks is the one the page
+    reported, which is why the chat core always passes it.
+    """
     ret = {
         "context": {
             "client": {
-                "visitorData": dat,
-                "userAgent": UA,
                 "clientName": "WEB",
-                "clientVersion": CLIENT_VERSION,
+                "clientVersion": client_version or CLIENT_VERSION,
             },
-
         },
         "continuation": continuation,
     }
     if replay:
         ret.setdefault("currentPlayerState", {
-                       "playerOffsetMs": str(int(offsetms))})
+                       "playerOffsetMs": str(int(max(0, offsetms)))})
     return ret
 
 
@@ -105,7 +134,7 @@ def get_channelid(client, video_id):
     try:
         if match is None:
             raise IndexError
-        ret = match.group(1)
+        ret = _first_group(match)
     except IndexError:
         ret = get_channelid_2nd(client, video_id)
     return ret
@@ -118,7 +147,7 @@ def get_channelid_2nd(client, video_id):
     if match is None:
         raise InvalidVideoIdException(f"Cannot find channel id for video id:{video_id}. This video id seems to be invalid.")
     try:
-        ret = match.group(1)
+        ret = _first_group(match)
     except IndexError:
         raise InvalidVideoIdException(f"Invalid video id: {video_id}")
     return ret
@@ -130,7 +159,7 @@ async def get_channelid_async(client, video_id):
     try:
         if match is None:
             raise IndexError
-        ret = match.group(1)
+        ret = _first_group(match)
     except IndexError:
         ret = await get_channelid_async_2nd(client, video_id)
     return ret
@@ -141,7 +170,7 @@ async def get_channelid_async_2nd(client, video_id):
     if match is None:
         raise InvalidVideoIdException(f"Cannot find channel id for video id:{video_id}. This video id seems to be invalid.")
     try:
-        ret = match.group(1)
+        ret = _first_group(match)
     except IndexError:
         raise InvalidVideoIdException(f"Invalid video id: {video_id}")
     return ret

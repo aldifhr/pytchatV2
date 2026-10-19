@@ -9,12 +9,14 @@ jobs:
     strategy:
       max-parallel: 4
       matrix:
-        python-version: [3.7, 3.8, 3.9]
+        # 3.7-3.9 are EOL, and the code now needs `asyncio.get_running_loop` and
+        # `X | None` syntax, both 3.10+.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -25,3 +27,10 @@ jobs:
         run: |
           export PYTHONPATH=./
           pytest --verbose --color=yes
+      - name: Self-check the chat path
+        # The pytest files cover parsing and processors; none of them checks that
+        # the continuation is scraped from the page rather than generated, which
+        # is the failure that made the library return zero chat items.
+        run: |
+          export PYTHONPATH=./
+          python tests/check_continuation.py

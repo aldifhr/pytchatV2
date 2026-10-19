@@ -11,7 +11,7 @@ from ..parser.live import Parser
 from .. import config
 from .. import exceptions
 from .. import util
-from ..paramgen import liveparam, arcparam
+from ..paramgen import resolver
 from ..processors.default.processor import DefaultProcessor
 from ..processors.combinator import Combinator
 
@@ -107,7 +107,9 @@ class LiveChat:
         self._pauser = Queue()
         self._pauser.put_nowait(None)
         self._first_fetch = replay_continuation is None
-        self._fetch_url = config._sml if replay_continuation is None else config._smr
+        self._api_key = None
+        self._client_version = None
+        self._session = None
         self._topchat_only = topchat_only
         self._dat = ''
         self._last_offset_ms = 0
@@ -117,7 +119,12 @@ class LiveChat:
 
         self.exception = None
         if interruptable:
-            signal.signal(signal.SIGINT, lambda a, b: self.terminate())
+            # This reader always runs in a worker thread, where `signal.signal`
+            # raises ValueError. Guarded so constructing it is not itself fatal.
+            try:
+                signal.signal(signal.SIGINT, lambda a, b: self.terminate())
+            except (ValueError, OSError):
+                self._logger.debug("SIGINT handler not installed (not the main thread).")
         self._setup()
 
     def _setup(self):
@@ -150,10 +157,13 @@ class LiveChat:
         create and start _listen loop.
         """
         if not self.continuation:
-            self.continuation = liveparam.getparam(
-                self._video_id,
-                channel_id=util.get_channelid(self._client, self._video_id),
-                past_sec=3)
+            # The page's own token. The 2021 generator encoded a protobuf YouTube
+            # no longer accepts; measured, its token returned zero chat items on a
+            # stream where the page's token returned dozens per poll.
+            self._session = resolver.resolve(self._client, self._video_id)
+            self._api_key = self._session.api_key
+            self._client_version = self._session.client_version
+            self.continuation = self._session.continuations[0]
         self._listen(self.continuation)
 
     def _listen(self, continuation):
@@ -166,33 +176,35 @@ class LiveChat:
             parameter for next chat data
         '''
         try:
-            with self._client as client:
-                while(continuation and self._is_alive):
-                    continuation = self._check_pause(continuation)
-                    contents = self._get_contents(continuation, client, headers)
-                    metadata, chatdata = self._parser.parse(contents)
-                    continuation = metadata.get('continuation')
-                    if continuation:
-                        self.continuation = continuation
-                    timeout = metadata['timeoutMs'] / 1000
-                    chat_component = {
-                        "video_id": self._video_id,
-                        "timeout": timeout,
-                        "chatdata": chatdata
-                    }
-                    time_mark = time.time()
-                    if self._direct_mode:
-                        processed_chat = self.processor.process(
-                            [chat_component])
-                        if isinstance(processed_chat, tuple):
-                            self._callback(*processed_chat)
-                        else:
-                            self._callback(processed_chat)
+            # Used directly, not as a context manager: the client is already open
+            # from the session fetch and httpx permits one `open()` per client.
+            client = self._client
+            while(continuation and self._is_alive):
+                continuation = self._check_pause(continuation)
+                contents = self._get_contents(continuation, client, headers)
+                metadata, chatdata = self._parser.parse(contents)
+                continuation = metadata.get('continuation')
+                if continuation:
+                    self.continuation = continuation
+                timeout = metadata['timeoutMs'] / 1000
+                chat_component = {
+                    "video_id": self._video_id,
+                    "timeout": timeout,
+                    "chatdata": chatdata
+                }
+                time_mark = time.time()
+                if self._direct_mode:
+                    processed_chat = self.processor.process(
+                        [chat_component])
+                    if isinstance(processed_chat, tuple):
+                        self._callback(*processed_chat)
                     else:
-                        self._buffer.put(chat_component)
-                    diff_time = timeout - (time.time() - time_mark)
-                    self._event.wait(diff_time if diff_time > 0 else 0)
-                    self._last_offset_ms = metadata.get('last_offset_ms', 0)
+                        self._callback(processed_chat)
+                else:
+                    self._buffer.put(chat_component)
+                diff_time = timeout - (time.time() - time_mark)
+                self._event.wait(diff_time if diff_time > 0 else 0)
+                self._last_offset_ms = metadata.get('last_offset_ms', 0)
         except exceptions.ChatParseException as e:
             self._logger.debug(f"[{self._video_id}]{str(e)}")
             raise
@@ -211,9 +223,12 @@ class LiveChat:
             '''
             self._pauser.put_nowait(None)
             if not self._is_replay:
-                continuation = liveparam.getparam(
-                    self._video_id, channel_id=util.get_channelid(httpx.Client(http2=True), self._video_id),
-                    past_sec=3, topchat_only=self._topchat_only)
+                # A fresh session on resume: the old token has been idle, and the
+                # page may have rotated the key and version it wants.
+                self._session = resolver.resolve(self._client, self._video_id)
+                self._api_key = self._session.api_key
+                self._client_version = self._session.client_version
+                continuation = self._session.continuations[0]
 
         return continuation
 
@@ -235,11 +250,13 @@ class LiveChat:
             if contents is None or self._is_replay:
                 '''Try to fetch archive chat data.'''
                 self._parser.is_replay = True
-                self._fetch_url = config._smr
-                continuation = arcparam.getparam(
-                    self._video_id, self.seektime, self._topchat_only, util.get_channelid(client, self._video_id))
+                seek = resolver.player_seek(client, self._session)
+                if not seek:
+                    raise exceptions.NoContinuation(
+                        "No playerSeek continuation on the watch page; "
+                        "the video may have no archived chat.")
                 livechat_json = self._get_livechat_json(
-                    continuation, client, replay=True, offset_ms=self.seektime * 1000)
+                    seek, client, replay=True, offset_ms=self.seektime * 1000)
                 reload_continuation = self._parser.reload_continuation(
                     self._parser.get_contents(livechat_json)[0])
                 if reload_continuation:
@@ -257,10 +274,14 @@ class LiveChat:
         livechat_json = None
         if offset_ms < 0:
             offset_ms = 0
-        param = util.get_param(continuation, dat=self._dat, replay=replay, offsetms=offset_ms)
+        param = util.get_param(
+            continuation, dat=self._dat, replay=replay,
+            offsetms=offset_ms, client_version=self._client_version)
+        base = config.REPLAY_CHAT_URL if replay else config.LIVE_CHAT_URL
+        url = f"{base}?key={self._api_key}&prettyPrint=false"
         for _ in range(MAX_RETRY + 1):
             try:
-                response = client.post(self._fetch_url, json=param)
+                response = client.post(url, json=param)
                 livechat_json = response.json()
                 break
             except (json.JSONDecodeError, httpx.HTTPError):

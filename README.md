@@ -11,9 +11,43 @@ without using Selenium or BeautifulSoup.
 
 Other features:
 + Customizable [chat data processors](https://github.com/taizan-hokuto/pytchat/wiki/ChatProcessor) including youtube api compatible one.
-+ Available on asyncio context. 
-+ Quick fetching of initial chat data by generating continuation params
-instead of web scraping.
++ Available on asyncio context.
+
+## Status (fork, 2026-10)
+
+This fork fixes a break that made the library fetch **zero chat items** while
+reporting no error. The cause was the continuation parameter: the original code
+*generated* it by re-encoding a protobuf that YouTube no longer accepts. Measured
+on one live stream, a generated token returned 0 items and the page's own token
+returned 75.
+
+What changed:
+
++ **Continuation tokens are read from the page**, not generated
+  (`pytchat/paramgen/resolver.py`). The InnerTube key and client version come
+  from that same page, so a rotation does not need a library release.
+  `liveparam` and `arcparam` are deleted — a fallback that yields an empty chat
+  hides the failure.
++ **Channel id regex** accepts the `\x22`-escaped JSON the site emits now, and
+  the id is no longer truncated to 21 characters by an optional group.
++ **`force_replay=True` actually reads the archive.** It used to take a live
+  token in `_setup` and then deliver nothing.
++ **Errors are surfaced, not buried.** A rejected request used to close the HTTP
+  client before recording the reason, so the caller saw "client has been closed".
++ **Python 3.10+.** `signal.signal` off the main thread no longer raises at
+  construction; `asyncio.get_event_loop` is now `get_running_loop`;
+  `CancelledError` is handled; the default `processor` is per-instance instead of
+  one object shared by every reader ever created.
+
+### Known broken upstream
+
+**Chat replay is dead.** `get_live_chat_replay` has answered
+"Request contains an invalid argument" for every continuation since
+mid-October 2025 — for this library, `chat-downloader`, `yt-dlp` and `ytarchive`
+alike. Nothing in this repo can fix it. `force_replay` raises
+`ReplayUnavailable` with that message instead of failing obscurely.
+
+**Live chat works.** Verified against a running stream: 34 items in 15s.
 
 For more detailed information, see [wiki](https://github.com/taizan-hokuto/pytchat/wiki). <br>
 [wiki (Japanese)](https://github.com/taizan-hokuto/pytchat/wiki/Home_jp)

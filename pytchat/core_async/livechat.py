@@ -12,7 +12,7 @@ from ..parser.live import Parser
 from .. import config
 from .. import exceptions
 from .. import util
-from ..paramgen import liveparam, arcparam
+from ..paramgen import resolver
 from ..processors.default.processor import DefaultProcessor
 from ..processors.combinator import Combinator
 
@@ -107,7 +107,9 @@ class LiveChatAsync:
         self._pauser = Queue()
         self._pauser.put_nowait(None)
         self._first_fetch = replay_continuation is None
-        self._fetch_url = config._sml if replay_continuation is None else config._smr
+        self._api_key = None
+        self._client_version = None
+        self._session = None
         self._topchat_only = topchat_only
         self._dat = ''
         self._last_offset_ms = 0
@@ -119,8 +121,13 @@ class LiveChatAsync:
         if exception_handler:
             self._set_exception_handler(exception_handler)
         if interruptable:
-            signal.signal(signal.SIGINT,
-                (lambda a, b: self._keyboard_interrupt()))
+            # Off the main thread `signal.signal` raises ValueError; a reader in a
+            # worker — the ordinary case under an app — must still construct.
+            try:
+                signal.signal(signal.SIGINT,
+                    (lambda a, b: self._keyboard_interrupt()))
+            except (ValueError, OSError):
+                self._logger.debug("SIGINT handler not installed (not the main thread).")
         self._setup()
 
     def _setup(self):
@@ -138,10 +145,10 @@ class LiveChatAsync:
                 pass
             else:
                 # Create a loop task to call callback if the `callback` param is specified.
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 loop.create_task(self._callback_loop(self._callback))
         # Start a loop task for _listen()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self.listen_task = loop.create_task(self._startlisten())
         # Register add_done_callback
         if self._done_callback is None:
@@ -154,11 +161,13 @@ class LiveChatAsync:
         create and start _listen loop.
         """
         if not self.continuation:
-            channel_id = await util.get_channelid_async(self._client, self._video_id)
-            self.continuation = liveparam.getparam(
-                self._video_id,
-                channel_id,
-                past_sec=3)
+            # The page's own token, not a generated one: the 2021 generator
+            # encoded a protobuf YouTube no longer accepts, and every request
+            # built from it came back with zero chat items.
+            self._session = await resolver.resolve_async(self._client, self._video_id)
+            self._api_key = self._session.api_key
+            self._client_version = self._session.client_version
+            self.continuation = self._session.continuations[0]
 
         await self._listen(self.continuation)
 
@@ -172,33 +181,37 @@ class LiveChatAsync:
             parameter for next chat data
         '''
         try:
-            async with self._client as client:
-                while(continuation and self._is_alive):
-                    continuation = await self._check_pause(continuation)
-                    contents = await self._get_contents(continuation, client, headers) #Q#
-                    metadata, chatdata = self._parser.parse(contents)
-                    continuation = metadata.get('continuation')
-                    if continuation:
-                        self.continuation = continuation
-                    timeout = metadata['timeoutMs'] / 1000
-                    chat_component = {
-                        "video_id": self._video_id,
-                        "timeout": timeout,
-                        "chatdata": chatdata
-                    }
-                    time_mark = time.time()
-                    if self._direct_mode:
-                        processed_chat = self.processor.process(
-                            [chat_component])
-                        if isinstance(processed_chat, tuple):
-                            await self._callback(*processed_chat)
-                        else:
-                            await self._callback(processed_chat)
+            # The client is used directly, not as a context manager: it was
+            # already opened when the session was resolved, and httpx allows one
+            # `open()` per client — `async with` here raised "Cannot open a client
+            # instance more than once" and the reader died before its first poll.
+            client = self._client
+            while(continuation and self._is_alive):
+                continuation = await self._check_pause(continuation)
+                contents = await self._get_contents(continuation, client, headers) #Q#
+                metadata, chatdata = self._parser.parse(contents)
+                continuation = metadata.get('continuation')
+                if continuation:
+                    self.continuation = continuation
+                timeout = metadata['timeoutMs'] / 1000
+                chat_component = {
+                    "video_id": self._video_id,
+                    "timeout": timeout,
+                    "chatdata": chatdata
+                }
+                time_mark = time.time()
+                if self._direct_mode:
+                    processed_chat = self.processor.process(
+                        [chat_component])
+                    if isinstance(processed_chat, tuple):
+                        await self._callback(*processed_chat)
                     else:
-                        await self._buffer.put(chat_component)
-                    diff_time = timeout - (time.time() - time_mark)
-                    await asyncio.sleep(diff_time)
-                    self._last_offset_ms = metadata.get('last_offset_ms', 0)
+                        await self._callback(processed_chat)
+                else:
+                    await self._buffer.put(chat_component)
+                diff_time = timeout - (time.time() - time_mark)
+                await asyncio.sleep(diff_time)
+                self._last_offset_ms = metadata.get('last_offset_ms', 0)
         except exceptions.ChatParseException as e:
             self._logger.debug(f"[{self._video_id}]{str(e)}")
             raise
@@ -217,11 +230,10 @@ class LiveChatAsync:
             '''
             self._pauser.put_nowait(None)
             if not self._is_replay:
-                async with self._client as client:
-                    channel_id = await util.get_channelid_async(client, self.video_id)
-                    continuation = liveparam.getparam(self._video_id, 
-                                    channel_id,
-                                    past_sec=3)
+                session = await resolver.resolve_async(self._client, self._video_id)
+                self._api_key = session.api_key
+                self._client_version = session.client_version
+                continuation = session.continuations[0]
                     
         return continuation
 
@@ -242,12 +254,13 @@ class LiveChatAsync:
             if contents is None or self._is_replay:
                 '''Try to fetch archive chat data.'''
                 self._parser.is_replay = True
-                self._fetch_url = config._smr
-                channelid = await util.get_channelid_async(client, self._video_id)
-                continuation = arcparam.getparam(
-                    self._video_id, self.seektime, self._topchat_only, channelid)
+                seek = await resolver.player_seek_async(client, self._session)
+                if not seek:
+                    raise exceptions.NoContinuation(
+                        "No playerSeek continuation on the watch page; "
+                        "the video may have no archived chat.")
                 livechat_json = (await self._get_livechat_json(
-                                 continuation, client, replay=True, offset_ms=self.seektime * 1000))
+                                 seek, client, replay=True, offset_ms=self.seektime * 1000))
                 reload_continuation = self._parser.reload_continuation(
                     self._parser.get_contents(livechat_json)[0])
                 if reload_continuation:
@@ -265,10 +278,14 @@ class LiveChatAsync:
         livechat_json = None
         if offset_ms < 0:
             offset_ms = 0
-        param = util.get_param(continuation, dat=self._dat, replay=replay, offsetms=offset_ms)
+        param = util.get_param(
+            continuation, dat=self._dat, replay=replay,
+            offsetms=max(0, offset_ms), client_version=self._client_version)
+        base = config.REPLAY_CHAT_URL if replay else config.LIVE_CHAT_URL
+        url = f"{base}?key={self._api_key}&prettyPrint=false"
         for _ in range(MAX_RETRY + 1):
             try:
-                resp = await client.post(self._fetch_url, json=param)
+                resp = await client.post(url, json=param)
                 livechat_json = resp.json()
                 break
             except (json.JSONDecodeError, httpx.HTTPError):
@@ -359,6 +376,12 @@ class LiveChatAsync:
             self.terminate()
         try:
             self.listen_task.result()
+        except (asyncio.CancelledError, CancelledError):
+            # A terminating reader cancels its own task; on Python 3.8+ that
+            # raises `CancelledError`, which is a `BaseException` and so slipped
+            # past the `except Exception` below, printing a traceback out of the
+            # event loop for a shutdown the caller asked for.
+            self.exception = exceptions.ChatDataFinished()
         except Exception as e:
             self.exception = e
             if not isinstance(e, exceptions.ChatParseException):

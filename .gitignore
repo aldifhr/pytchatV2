@@ -37,3 +37,6 @@ temporary/
 # Pypi wheel
 build/
 exclude/
+.venv-check/
+__pycache__/
+*.pyc
