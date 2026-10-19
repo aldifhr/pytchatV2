@@ -244,6 +244,14 @@ class LiveChat:
           -------
             'continuationContents' which includes metadata & chat data.
         '''
+        # A replay reader has no token yet: its first fetch *is* the archive
+        # fetch. Polling first sent `continuation: None` to the replay endpoint.
+        if self._first_fetch and self._is_replay and not continuation:
+            self._parser.is_replay = True
+            token = self._session.continuations[0] if self._session else None
+            if token:
+                self.continuation = token
+                continuation = token
         livechat_json = self._get_livechat_json(
             continuation, client, replay=self._is_replay, offset_ms=self._last_offset_ms)
         contents, dat = self._parser.get_contents(livechat_json)
@@ -251,22 +259,29 @@ class LiveChat:
             self._dat = dat
         if self._first_fetch:
             if contents is None or self._is_replay:
-                '''Try to fetch archive chat data.'''
+                # The archive's own token, not `playerSeek`: measured on three
+                # past broadcasts, this returns 48-51 items per batch where the
+                # seek token is rejected.
                 self._parser.is_replay = True
-                seek = resolver.player_seek(client, self._session)
-                if not seek:
-                    raise exceptions.NoContinuation(
-                        "No playerSeek continuation on the watch page; "
-                        "the video may have no archived chat.")
-                livechat_json = self._get_livechat_json(
-                    seek, client, replay=True, offset_ms=self.seektime * 1000)
-                reload_continuation = self._parser.reload_continuation(
-                    self._parser.get_contents(livechat_json)[0])
-                if reload_continuation:
-                    livechat_json = (self._get_livechat_json(
-                        reload_continuation, client, headers))
-                contents, _ = self._parser.get_contents(livechat_json)
                 self._is_replay = True
+                token = self.continuation or (
+                    self._session.continuations[0] if self._session else None)
+                if not token:
+                    raise exceptions.NoContinuation(
+                        "No chat continuation on the page; the video has no chat.")
+                livechat_json = self._get_livechat_json(
+                    token, client, replay=True, offset_ms=self.seektime * 1000)
+                if isinstance(livechat_json, dict) and "error" in livechat_json:
+                    message = livechat_json["error"].get("message", "rejected")
+                    raise exceptions.ReplayUnavailable(
+                        f"No archived chat for {self._video_id}: {message}")
+                contents, _ = self._parser.get_contents(livechat_json)
+                reload_continuation = self._parser.reload_continuation(contents)
+                if reload_continuation:
+                    livechat_json = self._get_livechat_json(
+                        reload_continuation, client, replay=True,
+                        offset_ms=self.seektime * 1000)
+                    contents, _ = self._parser.get_contents(livechat_json)
             self._first_fetch = False
         return contents
 

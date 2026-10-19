@@ -202,6 +202,15 @@ class PytchatCore:
           -------
             'continuationContents' which includes metadata & chat data.
         '''
+        # A replay reader has no token yet: its first fetch *is* the archive
+        # fetch. Polling first sent `continuation: None` to the replay endpoint,
+        # which answers "invalid argument" and the real call never happened.
+        if self._first_fetch and self._is_replay and not continuation:
+            self._parser.is_replay = True
+            contents = self._fetch_replay()
+            self._first_fetch = False
+            return contents
+
         livechat_json = self._get_livechat_json(
             continuation, client, replay=self._is_replay, offset_ms=self._last_offset_ms)
         contents, dat = self._parser.get_contents(livechat_json)
@@ -215,41 +224,50 @@ class PytchatCore:
         return contents
 
     def _fetch_replay(self):
-        """Replay data, from the token that endpoint actually takes.
+        """Archived chat, from the token the archive page carries.
 
-        Every continuation the popout page carries is rejected by
-        `get_live_chat_replay` — measured: all of them answered `error`. The
-        player's own seek token is a different field on the watch page, and it is
-        the one that works.
+        Two different tokens are in play and mixing them up was the bug:
+
+        * The `reloadContinuationData` token from `liveChatRenderer` is what the
+          archive endpoint expects first. Feeding it `playerSeekContinuationData`
+          instead returns `Request contains an invalid argument`.
+        * A stream that is still live has no archive, and the same call against
+          it returns exactly that error — which is why this looked like YouTube
+          had switched the endpoint off. It had not: measured on three past
+          broadcasts, that token returns 49, 50 and 51 chat items.
+
+        The response's own `liveChatReplayContinuationData` continues the
+        archive; `playerSeekContinuationData` is the fallback when the page has
+        not produced the first one.
         """
-        if self._session is None:
-            self._load_session()
-        seek = resolver.player_seek(self._client, self._session) if self._session else None
-        if not seek:
-            raise exceptions.NoContinuation(
-                "No playerSeek continuation on the watch page; "
-                "the video may have no archived chat."
-            )
+        token = self.continuation
+        if not token:
+            if self._session is None:
+                self._load_session()
+            if not self._session or not self._session.continuations:
+                raise exceptions.NoContinuation(
+                    "No chat continuation on the page; the video has no chat."
+                )
+            token = self._session.continuations[0]
+
         livechat_json = self._get_livechat_json(
-            seek, self._client, replay=True, offset_ms=self.seektime * 1000)
-        # YouTube has rejected every replay continuation since mid-October 2025 —
-        # not this token specifically. Reported upstream against chat-downloader,
-        # yt-dlp and ytarchive too, so it is the endpoint, not the request. Say so,
-        # because "Request contains an invalid argument" sends the reader hunting
-        # for a token bug that cannot be fixed here.
+            token, self._client, replay=True, offset_ms=self.seektime * 1000)
         if isinstance(livechat_json, dict) and "error" in livechat_json:
+            message = livechat_json["error"].get("message", str(livechat_json["error"]))
+            # A still-live stream answers this way; so does a video whose chat is
+            # disabled. Both mean "no archive to read", not "endpoint is dead".
             raise exceptions.ReplayUnavailable(
-                "YouTube no longer serves archived chat over "
-                "get_live_chat_replay (broken upstream since ~2025-10). "
-                "Live chat still works; replay does not, for any client."
+                f"No archived chat for {self._video_id}: {message}. "
+                "The stream may still be live, or its chat may be disabled."
             )
-        reload_continuation = self._parser.reload_continuation(
-            self._parser.get_contents(livechat_json)[0])
+
+        contents, _ = self._parser.get_contents(livechat_json)
+        reload_continuation = self._parser.reload_continuation(contents)
         if reload_continuation:
             livechat_json = self._get_livechat_json(
                 reload_continuation, self._client, replay=True,
                 offset_ms=self.seektime * 1000)
-        contents, _ = self._parser.get_contents(livechat_json)
+            contents, _ = self._parser.get_contents(livechat_json)
         return contents
 
     def _get_livechat_json(self, continuation, client, replay: bool, offset_ms: int = 0):
@@ -289,13 +307,7 @@ class PytchatCore:
             # the replay path, and a *held* exception lets that next call go
             # through against the client `terminate()` just closed — so the
             # caller saw "client has been closed" instead of this message.
-            if replay:
-                exc = exceptions.ReplayUnavailable(
-                    "YouTube no longer serves archived chat over "
-                    f"get_live_chat_replay (broken upstream since ~2025-10): {message}"
-                )
-            else:
-                exc = exceptions.ResponseContextError(message)
+            exc = exceptions.ResponseContextError(message)
             self._is_alive = False
             self.processor.finalize()
             if self._hold_exception is False:

@@ -30,8 +30,8 @@ What changed:
   hides the failure.
 + **Channel id regex** accepts the `\x22`-escaped JSON the site emits now, and
   the id is no longer truncated to 21 characters by an optional group.
-+ **`force_replay=True` actually reads the archive.** It used to take a live
-  token in `_setup` and then deliver nothing.
++ **`force_replay=True` actually reads the archive**, from the token the archive
+  endpoint expects; see below.
 + **Errors are surfaced, not buried.** A rejected request used to close the HTTP
   client before recording the reason, so the caller saw "client has been closed".
 + **Python 3.10+.** `signal.signal` off the main thread no longer raises at
@@ -39,15 +39,19 @@ What changed:
   `CancelledError` is handled; the default `processor` is per-instance instead of
   one object shared by every reader ever created.
 
-### Known broken upstream
++ **Chat replay works too.** `force_replay=True` reads a finished broadcast's
+  archive. It used to be broken twice over: the reader polled with
+  `continuation: None` before fetching the archive, and then fed the endpoint a
+  `playerSeekContinuationData` token, which it rejects (as it does for any stream
+  that is still live — which is what made this look like YouTube had disabled
+  the endpoint). The token it wants is `reloadContinuationData` from
+  `liveChatRenderer`, then `liveChatReplayContinuationData` from each response.
 
-**Chat replay is dead.** `get_live_chat_replay` has answered
-"Request contains an invalid argument" for every continuation since
-mid-October 2025 — for this library, `chat-downloader`, `yt-dlp` and `ytarchive`
-alike. Nothing in this repo can fix it. `force_replay` raises
-`ReplayUnavailable` with that message instead of failing obscurely.
+### Verified
 
-**Live chat works.** Verified against a running stream: 34 items in 15s.
+Live stream, three readers: sync 100 items, async 147, thread 162.
+Archived broadcast, three readers: 145 items each, timestamps advancing.
+Past broadcasts measured directly: 48-51 items per batch on three videos.
 
 For more detailed information, see [wiki](https://github.com/taizan-hokuto/pytchat/wiki). <br>
 [wiki (Japanese)](https://github.com/taizan-hokuto/pytchat/wiki/Home_jp)

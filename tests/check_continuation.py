@@ -1,14 +1,15 @@
 """Checks the parts of the chat path that broke, without needing a live stream.
 
-Run: python tests/check_continuation.py
+Run: python tests/check_continuation.py [--live VIDEO_ID] [--replay VIDEO_ID]
 
 The failures this covers were all silent: a token that returned zero items, a
 page whose JSON was escaped differently than the regex expected, an id that came
 out one character short. None of them raised. So each check below asserts on a
 value that was wrong before, not on "it ran".
 
-The live-network check is opt-in (`--live VIDEO_ID`) because CI has no stream to
-point at, and a test that silently skips when the network is down is not a test.
+The two network checks are opt-in (`--live` for a running stream, `--replay` for
+a finished broadcast) because CI has no stream to point at, and a test that
+silently skips when the network is down is not a test.
 """
 
 from __future__ import annotations
@@ -168,25 +169,40 @@ def check_pacing_is_bounded():
     print(f"ok  pacing bounded (70 messages in {elapsed:.1f}s)")
 
 
-def check_live(video_id: str):
-    """The whole path, against a real stream. Opt-in."""
-    import time
-
-    import httpx
-
-    import pytchat
-
-    chat = pytchat.create(video_id=video_id, interruptable=False)
-    assert chat.is_alive(), "reader died at construction"
+def _run(chat, batches=3):
     seen = 0
-    for _ in range(5):
+    for _ in range(batches):
         seen += len(list(chat.get().sync_items()))
-        time.sleep(3)
     chat.raise_for_status()
     chat.terminate()
-    assert seen > 0, "reader alive but delivered no chat in 15s"
-    print(f"ok  live: {seen} chat items in 15s")
-    _ = httpx  # imported for the reader's benefit; keeps the check honest
+    return seen
+
+
+def check_live(video_id: str):
+    """The whole live path. Opt-in."""
+    import pytchat
+
+    seen = _run(pytchat.create(video_id=video_id, interruptable=False))
+    assert seen > 0, "reader alive but delivered no chat"
+    print(f"ok  live: {seen} chat items")
+
+
+def check_replay(video_id: str):
+    """The whole archive path. Opt-in, and needs a *finished* broadcast.
+
+    The token that works is `reloadContinuationData` from `liveChatRenderer`.
+    Handing the endpoint a `playerSeekContinuationData` token — what the first
+    attempt at this fix did — returns `Request contains an invalid argument`, and
+    so does pointing it at a stream that is still live. Both look like YouTube
+    having disabled the endpoint; neither is.
+    """
+    import pytchat
+
+    chat = pytchat.create(video_id=video_id, interruptable=False, force_replay=True)
+    assert chat.is_replay(), "force_replay did not switch the reader"
+    seen = _run(chat)
+    assert seen > 0, "archive reader delivered nothing"
+    print(f"ok  replay: {seen} archived chat items")
 
 
 if __name__ == "__main__":
@@ -199,4 +215,6 @@ if __name__ == "__main__":
     check_pacing_is_bounded()
     if "--live" in sys.argv:
         check_live(sys.argv[sys.argv.index("--live") + 1])
+    if "--replay" in sys.argv:
+        check_replay(sys.argv[sys.argv.index("--replay") + 1])
     print("SELF-CHECK OK")
