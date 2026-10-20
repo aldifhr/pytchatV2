@@ -9,6 +9,10 @@ pytchat is a python library for fetching youtube live chat.
 pytchat is a python library for fetching youtube live chat
 without using Selenium or BeautifulSoup.
 
+This repository is a **fork** of [taizan-hokuto/pytchat](https://github.com/taizan-hokuto/pytchat),
+which is archived. Upstream is not maintained and its version does not work —
+see the status section below before installing anything.
+
 Other features:
 + Customizable [chat data processors](https://github.com/taizan-hokuto/pytchat/wiki/ChatProcessor) including youtube api compatible one.
 + Available on asyncio context.
@@ -57,9 +61,18 @@ For more detailed information, see [wiki](https://github.com/taizan-hokuto/pytch
 [wiki (Japanese)](https://github.com/taizan-hokuto/pytchat/wiki/Home_jp)
 
 ## Install
-```python
-pip install pytchat
+```bash
+pip install "pytchat @ git+https://github.com/aldifhr/pytchatV2.git@v0.6.0"
 ```
+
+Do not `pip install pytchat`. That resolves to 0.5.5 on PyPI — the archived
+upstream — which fetches zero chat items and reports no error. The version here
+is 0.6.0 and only exists in this fork, so the git URL is the only install that
+works.
+```
+pytchat @ git+https://github.com/aldifhr/pytchatV2.git@v0.6.0
+```
+in a `requirements.txt` for anything that pins it.
 ## Examples
 
 
